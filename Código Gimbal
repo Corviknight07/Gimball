@@ -6,102 +6,72 @@
 Servo ServoRoll;
 Servo ServoPitch;
 
-Servo ServoYaw;
-
 int16_t AcX, AcY, AcZ;
 int16_t Tmp;
 int16_t GyX, GyY, GyZ;
 
-float gyroX_off = 0, gyroY_off = 0, gyroZ_off = 0;
+float gyroX_off = 0.0f, gyroY_off = 0.0f, gyroZ_off = 0.0f;
 
-float Roll = 0, Pitch = 0;
-
-float Yaw = 0;
-
+float Roll = 0.0f, Pitch = 0.0f;
 unsigned long lastMicros = 0;
 
-float alpha = 0.96;
+float alpha = 0.99f;
 
-float Kp = 2.3;
-float Ki = 0.0;
-float Kd = 3.5;
+float Kp = 0.8f;
+float Ki = 0.0f;
+float Kd = 1.5f;
 
-float errR_prev = 0, errP_prev = 0;
-
-float errY_prev = 0;
-float intR = 0, intP = 0;
-
-float intY = 0;
-
+float intR = 0.0f, intP = 0.0f;
 
 int SERVO_MIN = 20;
 int SERVO_MAX = 160;
 int SERVO_CENTER = 90;
 
-float I_MAX = 100.0;
-float I_MIN = -100.0;
+float I_MAX = 100.0f;
+float I_MIN = -100.0f;
+float OUT_MAX = 70.0f;
+float OUT_MIN = -70.0f;
 
-float DER_MAX = 500.0;
-float DT_MIN = 1e-4;
+float D_alpha = 0.95f;
+float gyroRoll_filtered = 0.0f;
+float gyroPitch_filtered = 0.0f;
 
+float ANGLE_DEADBAND = 1.0f;
+float OUT_MIN_MOVE = 2.0f;
 
-void readMPU() {
+float SLEW_MAX_DEG_PER_S = 80.0f;
+float lastOutR_cmd = 0.0f;
+float lastOutP_cmd = 0.0f;
+
+bool DEBUG_CSV = true;
+bool INVERT_ROLL = false;
+bool INVERT_PITCH = false;
+
+float DT_MIN = 1e-4f;
+const int CALIB_SAMPLES = 1000;
+const int I2C_RETRY_LIMIT = 5;
+
+int i2cFailCount = 0;
+
+bool readMPU_safe() {
   Wire.beginTransmission(MPU);
   Wire.write(0x3B);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU, 14, true);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  uint8_t got = Wire.requestFrom(MPU, (uint8_t)14, (uint8_t)1);
+  if (got != 14) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
 
   AcX = (Wire.read() << 8) | Wire.read();
   AcY = (Wire.read() << 8) | Wire.read();
   AcZ = (Wire.read() << 8) | Wire.read();
-
   Tmp = (Wire.read() << 8) | Wire.read();
-
   GyX = (Wire.read() << 8) | Wire.read();
   GyY = (Wire.read() << 8) | Wire.read();
   GyZ = (Wire.read() << 8) | Wire.read();
-}
-
-void computeAngles(float dt) {
-
-  float accelRoll  = atan2((float)AcY, (float)AcZ) * 180.0 / PI;
-  float accelPitch = atan2(-(float)AcX, sqrt((float)AcY * (float)AcY + (float)AcZ * (float)AcZ)) * 180.0 / PI;
-
-
-  float gyroRoll  = ((float)GyX - gyroX_off) / 131.0;
-  float gyroPitch = ((float)GyY - gyroY_off) / 131.0;
-
-  float gyroYaw   = ((float)GyZ - gyroZ_off) / 131.0;
-
-
-  Roll  = alpha * (Roll  + gyroRoll * dt)  + (1.0 - alpha) * accelRoll;
-  Pitch = alpha * (Pitch + gyroPitch * dt) + (1.0 - alpha) * accelPitch;
-
-
-  Yaw += gyroYaw * dt;
-}
-
-float PID(float input, float target, float &prevErr, float &integral, float dt) {
-  if (dt < DT_MIN) dt = DT_MIN;
-
-  float err = target - input;
-  integral += err * dt;
-
-  if (integral > I_MAX) integral = I_MAX;
-  if (integral < I_MIN) integral = I_MIN;
-
-  float der = (err - prevErr) / dt;
-  prevErr = err;
-
-  if (der > DER_MAX) der = DER_MAX;
-  if (der < -DER_MAX) der = -DER_MAX;
-
-  float out = Kp * err + Ki * integral + Kd * der;
-
-  if (out > 70) out = 70;
-  if (out < -70) out = -70;
-
-  return out;
+  return true;
 }
 
 void mpuConfigure() {
@@ -131,18 +101,87 @@ void mpuConfigure() {
   Wire.endTransmission(true);
 }
 
-void calibrateGyro(int samples = 500) {
+void calibrateGyro(int samples) {
   long sumX = 0, sumY = 0, sumZ = 0;
-  for (int i = 0; i < samples; ++i) {
-    readMPU();
+  int collected = 0;
+
+  for (int i = 0; i < samples; i++) {
+    if (!readMPU_safe()) {
+      i--;
+      delay(3);
+      continue;
+    }
     sumX += GyX;
     sumY += GyY;
     sumZ += GyZ;
+    collected++;
     delay(3);
   }
-  gyroX_off = (float)sumX / samples;
-  gyroY_off = (float)sumY / samples;
-  gyroZ_off = (float)sumZ / samples;
+
+  gyroX_off = (float)sumX / collected;
+  gyroY_off = (float)sumY / collected;
+  gyroZ_off = (float)sumZ / collected;
+}
+
+void computeAngles_safe(float dt) {
+  float accelRoll = atan2(AcY, AcZ) * 180.0 / PI;
+  float accelPitch = atan2(-AcX, sqrt(AcY * AcY + AcZ * AcZ)) * 180.0 / PI;
+
+  float gyroRoll = (GyX - gyroX_off) / 131.0;
+  float gyroPitch = (GyY - gyroY_off) / 131.0;
+
+  if (dt <= 0 || dt > 0.5 || abs(gyroRoll) > 1000 || abs(gyroPitch) > 1000) {
+    Roll = accelRoll;
+    Pitch = accelPitch;
+    gyroRoll_filtered = 0;
+    gyroPitch_filtered = 0;
+    return;
+  }
+
+  Roll = alpha * (Roll + gyroRoll * dt) + (1 - alpha) * accelRoll;
+  Pitch = alpha * (Pitch + gyroPitch * dt) + (1 - alpha) * accelPitch;
+
+  gyroRoll_filtered = D_alpha * gyroRoll_filtered + (1 - D_alpha) * gyroRoll;
+  gyroPitch_filtered = D_alpha * gyroPitch_filtered + (1 - D_alpha) * gyroPitch;
+}
+
+float postProcessOutput(float rawOut, float &lastCmd, float dt) {
+  if (abs(rawOut) < OUT_MIN_MOVE) rawOut = 0;
+
+  float maxDelta = SLEW_MAX_DEG_PER_S * dt;
+  float delta = rawOut - lastCmd;
+  delta = constrain(delta, -maxDelta, maxDelta);
+
+  lastCmd += delta;
+  return lastCmd;
+}
+
+float computeControl_PDgyro(float angle, float target, float &integral, float dt, float gyroF, bool invert) {
+  if (dt < DT_MIN) dt = DT_MIN;
+
+  float error = target - angle;
+
+  if (abs(error) < ANGLE_DEADBAND) {
+    error = 0;
+    integral = 0;
+  } else {
+    integral += error * dt;
+    integral = constrain(integral, I_MIN, I_MAX);
+  }
+
+  float out = Kp * error + Ki * integral - Kd * gyroF;
+  if (invert) out = -out;
+
+  return constrain(out, OUT_MIN, OUT_MAX);
+}
+
+void handleI2CFailures() {
+  i2cFailCount++;
+  if (i2cFailCount >= I2C_RETRY_LIMIT) {
+    mpuConfigure();
+    delay(50);
+    i2cFailCount = 0;
+  }
 }
 
 void setup() {
@@ -152,44 +191,39 @@ void setup() {
   ServoRoll.attach(4);
   ServoPitch.attach(5);
 
-
-  ServoYaw.attach(6);
-
   mpuConfigure();
   delay(100);
+  calibrateGyro(CALIB_SAMPLES);
 
-  calibrateGyro(500);
+  if (readMPU_safe()) {
+    Roll = atan2(AcY, AcZ) * 180.0 / PI;
+    Pitch = atan2(-AcX, sqrt(AcY * AcY + AcZ * AcZ)) * 180.0 / PI;
+  }
 
   lastMicros = micros();
 }
 
 void loop() {
-  readMPU();
+  if (!readMPU_safe()) {
+    handleI2CFailures();
+    delay(5);
+    return;
+  }
+
+  i2cFailCount = 0;
 
   unsigned long now = micros();
-  float dt = (now - lastMicros) / 1000000.0;
+  float dt = (now - lastMicros) / 1e6;
   lastMicros = now;
 
-  computeAngles(dt);
+  computeAngles_safe(dt);
 
-  float outR = PID(Roll, 0.0, errR_prev, intR, dt);
-  float outP = PID(Pitch, 0.0, errP_prev, intP, dt);
-  // >>> AGREGADO: PID para Yaw <<<
-  float outY = PID(Yaw, 0.0, errY_prev, intY, dt);
+  float outR = computeControl_PDgyro(Roll, 0, intR, dt, gyroRoll_filtered, INVERT_ROLL);
+  float outP = computeControl_PDgyro(Pitch, 0, intP, dt, gyroPitch_filtered, INVERT_PITCH);
 
-  int servoR = constrain(SERVO_CENTER - (int)round(outR), SERVO_MIN, SERVO_MAX);
-  int servoP = constrain(SERVO_CENTER + (int)round(outP), SERVO_MIN, SERVO_MAX);
-  int servoY = constrain(SERVO_CENTER + (int)round(outY), SERVO_MIN, SERVO_MAX);
+  outR = postProcessOutput(outR, lastOutR_cmd, dt);
+  outP = postProcessOutput(outP, lastOutP_cmd, dt);
 
-  ServoRoll.write(servoR);
-  ServoPitch.write(servoP);
-  ServoYaw.write(servoY);
-
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 200) {
-    lastPrint = millis();
-    Serial.print("Yaw:"); Serial.print(Yaw, 2);
-    Serial.print(" outY:"); Serial.print(outY, 2);
-    Serial.println();
-  }
+  ServoRoll.write(constrain(SERVO_CENTER - outR, SERVO_MIN, SERVO_MAX));
+  ServoPitch.write(constrain(SERVO_CENTER + outP, SERVO_MIN, SERVO_MAX));
 }
